@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 ### Fixed
 
 - Don't disconnect from peers that return empty `FindBlocks` or `FindHeaders`
-  responses when the local node is at or near the chain tip
-  ([#10732](https://github.com/ZcashFoundation/zebra/pull/10732))
+  responses when the local node is at or near the chain tip, including when the
+  local tip is stale (mining paused, or the network parked at a shared tip)
+  ([#10732](https://github.com/ZcashFoundation/zebra/pull/10732),
+  [#10910](https://github.com/ZcashFoundation/zebra/pull/10910))
 
 ## [Zebra 6.0.0-rc.0](https://github.com/ZcashFoundation/zebra/releases/tag/v6.0.0-rc.0) - 2026-07-02
 
