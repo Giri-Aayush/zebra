@@ -21,7 +21,7 @@ use crate::{
 use indexmap::IndexMap;
 use tokio::sync::watch;
 
-use super::{PeerSetBuilder, PeerVersions};
+use super::{mock_peer_discovery_with_start_height, PeerSetBuilder, PeerVersions};
 
 #[test]
 fn peer_set_ready_single_connection() {
@@ -697,25 +697,28 @@ fn peer_set_route_inv_all_missing_fail() {
     });
 }
 
-/// Check that empty `FindBlocks` responses do not trigger stall tracking when the node is at the
-/// chain tip, so peers that correctly return no hashes are not disconnected.
+/// Check that empty `FindBlocks` responses from a peer at or below our tip do not trigger stall
+/// tracking, even when the wall-clock distance estimate wrongly reports us as far from the tip
+/// (a stale/frozen local tip, e.g. mining paused). This is the regression test for the tip
+/// estimate re-arming the stall tracker.
 #[test]
 fn find_blocks_stall_not_tracked_when_at_tip() {
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
-    let peer_versions = PeerVersions {
-        peer_versions: vec![peer_version],
-    };
 
     let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
-    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    // The peer advertised the same height as our tip, so it has nothing beyond it to send.
+    let (discovered_peers, handles) =
+        mock_peer_discovery_with_start_height(peer_version, block::Height(2_500_000));
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-    // Simulate being at the chain tip.
     best_tip.send_best_tip_height(Some(block::Height(2_500_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(0));
+    // Simulate a STALE/FROZEN tip: the wall-clock estimate says we're far behind the network.
+    // The old gate would treat this as "syncing" and disconnect the peer; the per-peer gate
+    // must not, because the peer is not ahead of us.
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(100_000));
 
     let mut handle = handles.into_iter().next().expect("there is one peer");
 
@@ -765,20 +768,21 @@ fn find_blocks_stall_not_tracked_when_at_tip() {
 #[test]
 fn find_blocks_stall_tracked_when_syncing() {
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
-    let peer_versions = PeerVersions {
-        peer_versions: vec![peer_version],
-    };
 
     let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
-    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    // The peer advertised a height 10,000 blocks above our tip, so empty responses are a broken
+    // promise: it claims to have blocks we don't, yet returns nothing.
+    let (discovered_peers, handles) =
+        mock_peer_discovery_with_start_height(peer_version, block::Height(2_500_000));
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-    // Simulate being far behind the chain tip, as during initial sync.
     best_tip.send_best_tip_height(Some(block::Height(2_490_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(10_000));
+    // Even with the wall-clock estimate reporting us at the tip, a peer that advertised a height
+    // above ours is still tracked: the gate keys on the peer's height, not the estimate.
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(0));
 
     let mut handle = handles.into_iter().next().expect("there is one peer");
 
@@ -825,20 +829,18 @@ fn find_blocks_stall_tracked_when_syncing() {
 #[test]
 fn find_blocks_stall_tracked_when_tip_unknown() {
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
-    let peer_versions = PeerVersions {
-        peer_versions: vec![peer_version],
-    };
 
     let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
-    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    // The peer advertised a real height while our state is empty.
+    let (discovered_peers, handles) =
+        mock_peer_discovery_with_start_height(peer_version, block::Height(2_500_000));
     let (minimum_peer_version, _best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-    // Leave the chain tip in its default state (None height, None distance).
-    // is_at_or_near_network_tip returns false when the tip is unknown, so stall
-    // tracking is active.
+    // Leave the chain tip in its default state (None height). An unknown tip is treated as
+    // height 0, so any peer advertising a real height is ahead of us and stall tracking is active.
 
     let mut handle = handles.into_iter().next().expect("there is one peer");
 
@@ -884,20 +886,20 @@ fn find_blocks_stall_tracked_when_tip_unknown() {
 #[test]
 fn find_blocks_stall_count_preserved_across_tip_transition() {
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
-    let peer_versions = PeerVersions {
-        peer_versions: vec![peer_version],
-    };
 
     let (runtime, _init_guard) = zebra_test::init_async();
     let _guard = runtime.enter();
 
-    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    // The peer advertised height 2,500,000 throughout; the transition is driven by our own tip
+    // crossing that height, which is what the per-peer stall gate keys on.
+    let (discovered_peers, handles) =
+        mock_peer_discovery_with_start_height(peer_version, block::Height(2_500_000));
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-    // Start syncing: FIND_RESPONSE_STALL_THRESHOLD - 1 stalls away from disconnect.
+    // Start syncing (our tip below the peer): FIND_RESPONSE_STALL_THRESHOLD - 1 stalls away from
+    // disconnect.
     best_tip.send_best_tip_height(Some(block::Height(2_490_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(10_000));
 
     let mut handle = handles.into_iter().next().expect("there is one peer");
 
@@ -926,9 +928,9 @@ fn find_blocks_stall_count_preserved_across_tip_transition() {
             response_fut.await.expect("response received");
         }
 
-        // Transition to at-tip: stall count is now THRESHOLD - 1 (one below disconnect).
+        // Transition to at-tip (our tip reaches the peer's advertised height): stall count is now
+        // THRESHOLD - 1 (one below disconnect).
         best_tip.send_best_tip_height(Some(block::Height(2_500_000)));
-        best_tip.send_estimated_distance_to_network_chain_tip(Some(0));
 
         // Send one empty response at tip. Since track_stalls is false, no stall event is
         // emitted and the peer's accumulated count is unchanged.
@@ -950,8 +952,9 @@ fn find_blocks_stall_count_preserved_across_tip_transition() {
             response_fut.await.expect("response received");
         }
 
-        // Transition back to syncing: count is still THRESHOLD - 1.
-        best_tip.send_estimated_distance_to_network_chain_tip(Some(10_000));
+        // Transition back to syncing (our tip falls below the peer's height): count is still
+        // THRESHOLD - 1.
+        best_tip.send_best_tip_height(Some(block::Height(2_490_000)));
 
         // One more syncing response reaches the threshold.
         {

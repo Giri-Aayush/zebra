@@ -125,7 +125,11 @@ use tower::{
     Service,
 };
 
-use zebra_chain::{chain_tip::ChainTip, parameters::Network};
+use zebra_chain::{
+    block,
+    chain_tip::{ChainTip, AT_OR_NEAR_TIP_THRESHOLD},
+    parameters::Network,
+};
 
 use crate::{
     address_book::AddressMetrics,
@@ -947,13 +951,22 @@ where
                 &req,
                 Request::FindBlocks { .. } | Request::FindHeaders { .. }
             );
-            let is_syncing = || {
-                !self
-                    .minimum_peer_version
-                    .chain_tip()
-                    .is_at_or_near_network_tip(&self.network)
-            };
-            let track_stalls = is_find_request && is_syncing();
+            // Only penalise empty or failed find responses from a peer that advertised a height
+            // meaningfully above our own tip. A peer at or below our tip legitimately has nothing
+            // beyond it to send, so its empty responses are expected — including when our own tip
+            // is stale (mining paused, or the whole network parked at a shared tip), where
+            // extrapolating the distance to the network tip from wall-clock time (as
+            // `ChainTip::is_at_or_near_network_tip` does) would wrongly report us as still syncing
+            // and re-arm the stall tracker. Deciding per-peer, rather than from a single global
+            // tip estimate, also means a peer lying about its height can only get itself dropped,
+            // never an honest peer.
+            let our_tip = self
+                .minimum_peer_version
+                .chain_tip()
+                .best_tip_height()
+                .unwrap_or(block::Height(0));
+            let peer_claims_ahead = svc.remote_start_height() - our_tip > AT_OR_NEAR_TIP_THRESHOLD;
+            let track_stalls = is_find_request && peer_claims_ahead;
 
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
