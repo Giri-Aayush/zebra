@@ -162,7 +162,7 @@ where
 
     /// Returns the sum of all value pool balances.
     pub fn total(self) -> Result<Amount<C>, amount::Error> {
-        self.transparent + self.sprout + self.sapling + self.orchard + self.deferred
+        self.transparent + self.sprout + self.sapling + self.orchard + self.deferred + self.ironwood
     }
 
     /// Convert this value balance to a different ValueBalance type,
@@ -331,21 +331,23 @@ impl ValueBalance<NonNegative> {
 
     /// Create a fake value pool for testing purposes.
     ///
-    /// The resulting [`ValueBalance`] will have half of the MAX_MONEY amount on each pool.
+    /// The resulting [`ValueBalance`] has `MAX_MONEY / 8` on each pool. This keeps the sum of all
+    /// pools within the valid `Amount` range (see [`ValueBalance::total`]), while leaving headroom
+    /// for the value pool changes that tests commit on top of it.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn fake_populated_pool() -> ValueBalance<NonNegative> {
         let mut fake_value_pool = ValueBalance::zero();
 
         let fake_transparent_value_balance =
-            ValueBalance::from_transparent_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_transparent_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_sprout_value_balance =
-            ValueBalance::from_sprout_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_sprout_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_sapling_value_balance =
-            ValueBalance::from_sapling_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_sapling_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_orchard_value_balance =
-            ValueBalance::from_orchard_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_orchard_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_ironwood_value_balance =
-            ValueBalance::from_ironwood_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_ironwood_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
 
         fake_value_pool.set_transparent_value_balance(fake_transparent_value_balance);
         fake_value_pool.set_sprout_value_balance(fake_sprout_value_balance);
