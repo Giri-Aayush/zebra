@@ -169,19 +169,16 @@ where
     /// if it satisfies the new constraint
     pub fn constrain<C2>(self) -> Result<ValueBalance<C2>, ValueBalanceError>
     where
-        C2: Constraint + Copy,
+        C2: Constraint,
     {
-        let value_balance = ValueBalance::<C2> {
+        Ok(ValueBalance::<C2> {
             transparent: self.transparent.constrain().map_err(Transparent)?,
             sprout: self.sprout.constrain().map_err(Sprout)?,
             sapling: self.sapling.constrain().map_err(Sapling)?,
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
-        };
-
-        value_balance.total().map_err(ValueBalanceError::Total)?;
-        Ok(value_balance)
+        })
     }
 }
 
@@ -326,7 +323,13 @@ impl ValueBalance<NonNegative> {
             .expect("conversion from NonNegative to NegativeAllowed is always valid");
         chain_value_pool = (chain_value_pool + chain_value_pool_change)?;
 
-        chain_value_pool.constrain()
+        let chain_value_pool = chain_value_pool.constrain::<NonNegative>()?;
+
+        // The sum of all chain value pools is the total monetary base, which consensus caps at
+        // `MAX_MONEY`. Reject any change that would push the chain value pool total over that cap.
+        chain_value_pool.total().map_err(ValueBalanceError::Total)?;
+
+        Ok(chain_value_pool)
     }
 
     /// Create a fake value pool for testing purposes.
