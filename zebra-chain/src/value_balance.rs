@@ -162,7 +162,19 @@ where
 
     /// Returns the sum of all value pool balances.
     pub fn total(self) -> Result<Amount<C>, amount::Error> {
-        self.transparent + self.sprout + self.sapling + self.orchard + self.deferred + self.ironwood
+        let total: i128 = [
+            self.transparent,
+            self.sprout,
+            self.sapling,
+            self.orchard,
+            self.deferred,
+            self.ironwood,
+        ]
+        .into_iter()
+        .map(|amount| i128::from(amount.zatoshis()))
+        .sum();
+
+        Amount::try_from(total)
     }
 
     /// Convert this value balance to a different ValueBalance type,
