@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AT_OR_NEAR_TIP_THRESHOLD` constant and `ChainTip::is_at_or_near_network_tip()`
   method for determining whether the node is within 5 blocks of the estimated network tip
   ([#10732](https://github.com/ZcashFoundation/zebra/pull/10732))
+- `ValueBalance::total`, which returns the sum of all value pool balances, and the
+  `ValueBalanceError::Total` variant returned when that sum is out of range
+  ([#10817](https://github.com/ZcashFoundation/zebra/pull/10817))
 
 ## [11.0.0] - 2026-07-02
 
