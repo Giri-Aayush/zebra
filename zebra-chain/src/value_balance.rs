@@ -334,9 +334,10 @@ impl ValueBalance<NonNegative> {
 
     /// Create a fake value pool for testing purposes.
     ///
-    /// The resulting [`ValueBalance`] has `MAX_MONEY / 8` on each pool. This keeps the sum of all
-    /// pools within the valid `Amount` range (see [`ValueBalance::total`]), while leaving headroom
-    /// for the value pool changes that tests commit on top of it.
+    /// The resulting [`ValueBalance`] has `MAX_MONEY / 8` on the transparent, Sprout, Sapling,
+    /// Orchard, and Ironwood pools; the deferred pool is zero. This keeps the total within the
+    /// valid `Amount` range (see [`ValueBalance::total`]), while leaving headroom for value pool
+    /// changes that tests commit on top of it.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn fake_populated_pool() -> ValueBalance<NonNegative> {
         let mut fake_value_pool = ValueBalance::zero();
