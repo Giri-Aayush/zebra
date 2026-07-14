@@ -201,6 +201,73 @@ fn coinbase_cache_reuses_built_coinbase() {
     assert!(cache.get(height, fee).is_none(), "a cleared cache misses");
 }
 
+/// Reproduces #10907: the single-slot coinbase cache evicts the zero-fee fake coinbase when
+/// storing the real-fee coinbase, and vice versa. With fee-paying mempool transactions, the
+/// cache never helps because each `getblocktemplate` call needs both keys.
+#[test]
+fn coinbase_cache_evicts_fake_coinbase_when_real_fee_stored() {
+    use super::CoinbaseCache;
+
+    let height = Height(1_000_000);
+    let zero_fee = Amount::zero();
+    let real_fee: Amount<zebra_chain::amount::NonNegative> =
+        Amount::try_from(10_000).expect("valid amount");
+
+    let cache = CoinbaseCache::default();
+
+    // Simulate what getblocktemplate does: store a fake coinbase at zero fee (ZIP-317 sizing),
+    // then store the real coinbase at the actual fee.
+    let fake_coinbase = TransactionTemplate::new_coinbase(
+        &Network::Mainnet,
+        height,
+        &MinerParams::from(
+            Address::decode(
+                &Network::Mainnet,
+                default_miner_address(
+                    zebra_chain::parameters::NetworkKind::Mainnet,
+                    &MinerAddressType::Sapling,
+                ),
+            )
+            .unwrap(),
+        ),
+        zero_fee,
+    )
+    .unwrap();
+
+    let real_coinbase = TransactionTemplate::new_coinbase(
+        &Network::Mainnet,
+        height,
+        &MinerParams::from(
+            Address::decode(
+                &Network::Mainnet,
+                default_miner_address(
+                    zebra_chain::parameters::NetworkKind::Mainnet,
+                    &MinerAddressType::Sapling,
+                ),
+            )
+            .unwrap(),
+        ),
+        real_fee,
+    )
+    .unwrap();
+
+    cache.store(height, zero_fee, fake_coinbase.clone());
+    cache.store(height, real_fee, real_coinbase.clone());
+
+    // BUG: the zero-fee entry was evicted by the real-fee store.
+    // This assert fails, proving the cache can't hold both entries simultaneously.
+    assert_eq!(
+        cache.get(height, zero_fee),
+        Some(fake_coinbase),
+        "zero-fee fake coinbase should still be cached after storing real-fee coinbase"
+    );
+    assert_eq!(
+        cache.get(height, real_fee),
+        Some(real_coinbase),
+        "real-fee coinbase should be cached"
+    );
+}
+
 /// From NU6.3 onward, a shielded coinbase paid to a Unified miner address with an Orchard
 /// receiver routes newly minted value into the Ironwood pool, not the Orchard pool, and remains
 /// recoverable with the consensus-required all-zero outgoing viewing key.
