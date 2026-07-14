@@ -266,6 +266,36 @@ fn coinbase_cache_evicts_fake_coinbase_when_real_fee_stored() {
         Some(real_coinbase),
         "real-fee coinbase should be cached"
     );
+
+    // Height transition: storing at a new height evicts the stale entries.
+    let next_height = Height(height.0 + 1);
+    let next_coinbase = TransactionTemplate::new_coinbase(
+        &Network::Mainnet,
+        next_height,
+        &MinerParams::from(
+            Address::decode(
+                &Network::Mainnet,
+                default_miner_address(
+                    zebra_chain::parameters::NetworkKind::Mainnet,
+                    &MinerAddressType::Sapling,
+                ),
+            )
+            .unwrap(),
+        ),
+        zero_fee,
+    )
+    .unwrap();
+
+    cache.store(next_height, zero_fee, next_coinbase.clone());
+    assert_eq!(
+        cache.get(next_height, zero_fee),
+        Some(next_coinbase),
+        "new-height entry should be cached"
+    );
+    assert!(
+        cache.get(height, zero_fee).is_none(),
+        "old-height entry should be evicted"
+    );
 }
 
 /// From NU6.3 onward, a shielded coinbase paid to a Unified miner address with an Orchard
