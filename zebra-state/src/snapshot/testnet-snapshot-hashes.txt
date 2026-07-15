@@ -1,0 +1,11 @@
+# Trusted zsnap manifest hashes for the Zcash test network.
+#
+# Format: one "<height> <BLAKE2b-256 manifest hash, hex>" entry per line.
+# Blank lines and lines starting with '#' are ignored.
+#
+# A snapshot whose MANIFEST.json hashes to the value listed for its height is trusted the
+# same way a checkpointed block is: the trust root is this reviewed, signed in-tree list,
+# not any single publisher. An entry is added only after independent reproducible-hash
+# attestations agree at that height (see the attestations process in the zsnap repo).
+#
+75200 a5db82a2b922f0d402b737088e824153aa15285959044199ee3554667f320666

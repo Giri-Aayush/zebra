@@ -279,6 +279,14 @@ impl ZebraDb {
         self.db.path()
     }
 
+    /// Returns the inner low-level database wrapper, for raw column family access.
+    ///
+    /// Used by the state snapshot export/import code, which copies raw key-value
+    /// bytes without interpreting them.
+    pub(crate) fn disk_db(&self) -> &DiskDb {
+        &self.db
+    }
+
     /// Check for panics in code running in spawned threads.
     /// If a thread exited with a panic, resume that panic.
     ///

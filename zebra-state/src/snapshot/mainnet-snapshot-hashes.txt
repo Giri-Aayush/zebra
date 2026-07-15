@@ -1,0 +1,7 @@
+# Trusted zsnap manifest hashes for the Zcash main network.
+#
+# Format: one "<height> <BLAKE2b-256 manifest hash, hex>" entry per line.
+# Blank lines and lines starting with '#' are ignored.
+#
+# No mainnet snapshot is blessed yet. An entry is added only after independent
+# reproducible-hash attestations agree at a pinned height (see the attestations process).
