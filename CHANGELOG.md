@@ -5,6 +5,22 @@ All notable changes to Zebra are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- New `zebrad export-snapshot` and `zebrad import-snapshot` subcommands for
+  verifiable state snapshots (assumeutxo-style fast sync). Export writes every
+  state column family as raw key-value chunks with a BLAKE2b-256-hashed
+  manifest, and works against a running node (read-only secondary mode).
+  Import authenticates the manifest against `--expect-hash` or a trusted hash
+  embedded in the binary (like block checkpoints), verifies every chunk,
+  builds the database in a temporary directory, and renames it into place
+  atomically, so an interrupted import can never leave a half-populated
+  state. `import-snapshot --url` downloads a snapshot first, with resumable
+  HTTP range requests. Unverifiable snapshots are refused unless
+  `--allow-unverified` is passed.
+
 ## [Zebra 6.0.0](https://github.com/ZcashFoundation/zebra/releases/tag/v6.0.0) - 2026-07-10
 
 ### Added

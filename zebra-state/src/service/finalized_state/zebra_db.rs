@@ -287,6 +287,18 @@ impl ZebraDb {
         &self.db
     }
 
+    /// Waits for any running format change task to finish, resuming its panic if it
+    /// panicked.
+    ///
+    /// Used by snapshot import so its raw bulk writes can never race the newly-created
+    /// database's background format task: that task's validity checks would observe a
+    /// partially imported state and fail.
+    pub(crate) fn join_format_change_task(&mut self) {
+        if let Some(format_change_handle) = self.format_change_handle.as_mut() {
+            format_change_handle.wait_for_panics();
+        }
+    }
+
     /// Check for panics in code running in spawned threads.
     /// If a thread exited with a panic, resume that panic.
     ///

@@ -36,7 +36,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use semver::Version;
@@ -77,9 +77,6 @@ const MAX_KEY_LEN: u32 = 16 * 1024 * 1024;
 /// Sanity limit for a single value read from a chunk file.
 const MAX_VALUE_LEN: u32 = 256 * 1024 * 1024;
 
-/// How long to wait for the newly created database's format version file to be written.
-const VERSION_FILE_WAIT: Duration = Duration::from_secs(30);
-
 /// The personalization string for snapshot BLAKE2b-256 hashes.
 const HASH_PERSONALIZATION: &[u8] = b"ZebraSnapshotV1";
 
@@ -102,27 +99,45 @@ const TESTNET_SNAPSHOT_HASHES: &str = include_str!("snapshot/testnet-snapshot-ha
 pub fn trusted_manifest_hash(network: &Network, height: u32) -> Option<String> {
     let list = if matches!(network, Network::Mainnet) {
         MAINNET_SNAPSHOT_HASHES
-    } else {
+    } else if network.is_default_testnet() {
         TESTNET_SNAPSHOT_HASHES
+    } else {
+        // Regtest and custom testnets have their own chains, so hashes for the public
+        // testnet must never verify their snapshots.
+        return None;
     };
+
     parse_snapshot_hashes(list)
+        .expect("embedded snapshot hash lists are compile-time constants validated by tests")
+        .into_iter()
         .find(|(entry_height, _)| *entry_height == height)
-        .map(|(_, hash)| hash.to_lowercase())
+        .map(|(_, hash)| hash)
 }
 
-/// Parses embedded snapshot-hash file lines into `(height, hash)` pairs.
+/// Parses embedded snapshot-hash file lines into `(height, lowercase hash)` pairs.
 ///
-/// Each entry is `<height> <hex-hash>`; blank lines and lines starting with `#` are skipped.
-fn parse_snapshot_hashes(list: &str) -> impl Iterator<Item = (u32, &str)> {
+/// Each entry is `<height> <64-char hex hash>`; blank lines and lines starting with `#` are
+/// skipped. Malformed lines are hard errors: silently dropping one would silently delete a
+/// trust anchor, downgrading blessed-height imports to the unverified path.
+fn parse_snapshot_hashes(list: &str) -> Result<Vec<(u32, String)>, BoxError> {
     list.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| {
+        .map(|line| {
             let mut parts = line.split_whitespace();
-            let height = parts.next()?.parse().ok()?;
-            let hash = parts.next()?;
-            Some((height, hash))
+            let (Some(height), Some(hash), None) = (parts.next(), parts.next(), parts.next())
+            else {
+                return Err(format!("malformed snapshot hash line: {line:?}").into());
+            };
+            let height = height
+                .parse()
+                .map_err(|_| format!("invalid height in snapshot hash line: {line:?}"))?;
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("invalid hash in snapshot hash line: {line:?}").into());
+            }
+            Ok((height, hash.to_lowercase()))
         })
+        .collect()
 }
 
 /// Metadata for one exported column family chunk file.
@@ -166,6 +181,30 @@ pub struct SnapshotManifest {
     pub chunks: Vec<ChunkEntry>,
 }
 
+/// How a snapshot manifest was authenticated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationSource {
+    /// Verified against a hash the operator supplied explicitly.
+    ExplicitHash,
+
+    /// Verified against the hash embedded in this binary for the snapshot's
+    /// network and height, like a block checkpoint.
+    EmbeddedHash,
+
+    /// Not verified: the operator explicitly allowed an unverified import.
+    Unverified,
+}
+
+impl std::fmt::Display for VerificationSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerificationSource::ExplicitHash => f.write_str("explicit --expect-hash"),
+            VerificationSource::EmbeddedHash => f.write_str("embedded trusted hash"),
+            VerificationSource::Unverified => f.write_str("UNVERIFIED"),
+        }
+    }
+}
+
 /// A summary of a completed export or import, for logging and display.
 #[derive(Clone, Debug)]
 pub struct SnapshotSummary {
@@ -174,6 +213,10 @@ pub struct SnapshotSummary {
 
     /// The hex-encoded BLAKE2b-256 hash of the manifest file bytes.
     pub manifest_hash: String,
+
+    /// How the manifest was authenticated. Always `ExplicitHash` for exports:
+    /// the exporter computed the hash itself.
+    pub verification: VerificationSource,
 
     /// The snapshot tip height.
     pub tip_height: block::Height,
@@ -213,6 +256,64 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<SnapshotManifest, BoxError> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
+/// Resolves and enforces the manifest trust policy, shared by import and download.
+///
+/// An explicit `expected_hash` wins; otherwise the hash embedded in this binary for the
+/// snapshot's (network, declared height) is used, like a block checkpoint. When neither
+/// exists this is a hard error unless `allow_unverified` is set: the manifest author
+/// chooses the declared height, so silently proceeding would let a hostile publisher pick
+/// any non-blessed height and bypass verification entirely.
+///
+/// Returns the manifest hash and how it was verified.
+pub fn verify_manifest_hash(
+    network: &Network,
+    manifest_bytes: &[u8],
+    declared_height: u32,
+    expected_hash: Option<&str>,
+    allow_unverified: bool,
+) -> Result<(String, VerificationSource), BoxError> {
+    let manifest_hash = hash_bytes(manifest_bytes);
+
+    let (source, expected) = match expected_hash {
+        Some(expected) => (
+            VerificationSource::ExplicitHash,
+            expected.trim().to_lowercase(),
+        ),
+        None => match trusted_manifest_hash(network, declared_height) {
+            Some(hash) => (VerificationSource::EmbeddedHash, hash),
+            None if allow_unverified => {
+                tracing::warn!(
+                    %manifest_hash,
+                    "using UNVERIFIED snapshot: no expected hash was given and no trusted \
+                     hash is embedded for this network and height. Only do this with \
+                     snapshots you exported yourself."
+                );
+                return Ok((manifest_hash, VerificationSource::Unverified));
+            }
+            None => {
+                return Err(format!(
+                    "cannot authenticate snapshot: no expected hash was given and no \
+                     trusted hash is embedded for this network at height {declared_height}. \
+                     Pass --expect-hash <hash> from a trusted source, or --allow-unverified \
+                     for a snapshot you exported yourself."
+                )
+                .into());
+            }
+        },
+    };
+
+    if manifest_hash != expected {
+        return Err(format!(
+            "snapshot manifest hash mismatch: expected {expected} ({source}), got \
+             {manifest_hash}. The snapshot may be corrupted or malicious, refusing to use it."
+        )
+        .into());
+    }
+
+    tracing::info!(%manifest_hash, %source, "snapshot manifest hash verified");
+    Ok((manifest_hash, source))
+}
+
 /// Exports a snapshot of the finalized state configured in `config` into `snapshot_dir`.
 ///
 /// Opens the database in read-only secondary mode, so it works on a running node's
@@ -248,7 +349,24 @@ pub fn export_snapshot(
         .tip()
         .ok_or("cannot export a snapshot of an empty state: no finalized tip")?;
 
+    // Refuse to export a database whose on-disk format is behind this binary's:
+    // read-only mode skips format upgrades, so the data could be missing migrations
+    // that the manifest's version stamp would falsely claim are present.
     let db_format_version = state_database_format_version_in_code();
+    let on_disk_version = database_format_version_on_disk(
+        config,
+        STATE_DATABASE_KIND,
+        db_format_version.major,
+        network,
+    )?
+    .ok_or("no on-disk database format version found; run the node once, then export")?;
+    if on_disk_version != db_format_version {
+        return Err(format!(
+            "cannot export: on-disk database format is {on_disk_version}, this Zebra uses \
+             {db_format_version}. Run the node until format upgrades finish, then export."
+        )
+        .into());
+    }
 
     tracing::info!(
         ?tip_height,
@@ -285,6 +403,7 @@ pub fn export_snapshot(
         };
 
         write_hashed(CHUNK_MAGIC, &mut writer)?;
+        // Cast is safe: these are in-memory buffer lengths, far below u64::MAX.
         bytes += CHUNK_MAGIC.len() as u64;
 
         for (key, value) in cf.zs_forward_range_iter(..) {
@@ -307,6 +426,7 @@ pub fn export_snapshot(
             write_hashed(value, &mut writer)?;
 
             records += 1;
+            // Casts are safe: both lengths fit in u32, checked by the try_into above.
             bytes += 8 + key.len() as u64 + value.len() as u64;
         }
 
@@ -347,11 +467,12 @@ pub fn export_snapshot(
     };
 
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    fs::write(&manifest_path, &manifest_bytes)?;
+    // Atomic write: a crash mid-write must not leave a truncated manifest, which would
+    // wedge the snapshot directory (export refuses to overwrite an existing manifest).
+    zebra_chain::common::atomic_write(manifest_path.clone(), &manifest_bytes)?
+        .map_err(|e| format!("failed to persist manifest: {e}"))?;
 
-    let mut hasher = snapshot_hasher();
-    hasher.update(&manifest_bytes);
-    let manifest_hash = hex::encode(hasher.finalize().as_bytes());
+    let manifest_hash = hash_bytes(&manifest_bytes);
 
     let elapsed = start_time.elapsed();
     tracing::info!(
@@ -367,6 +488,7 @@ pub fn export_snapshot(
     Ok(SnapshotSummary {
         snapshot_dir: snapshot_dir.to_path_buf(),
         manifest_hash,
+        verification: VerificationSource::ExplicitHash,
         tip_height,
         tip_hash,
         total_records,
@@ -376,9 +498,10 @@ pub fn export_snapshot(
 
 /// Imports the snapshot in `snapshot_dir` into a fresh state database configured in `config`.
 ///
-/// If `expected_manifest_hash` is provided, the manifest file hash must match it exactly.
-/// Without it, the import is *unverified*: only use unverified imports with snapshots
-/// you exported yourself.
+/// The manifest must authenticate: against `expected_manifest_hash` when provided, or the
+/// hash embedded in this binary for the snapshot's network and height. When neither exists
+/// the import is refused unless `allow_unverified` is set — only use unverified imports
+/// with snapshots you exported yourself.
 ///
 /// Refuses to import over an existing state database.
 pub fn import_snapshot(
@@ -386,46 +509,22 @@ pub fn import_snapshot(
     network: &Network,
     snapshot_dir: &Path,
     expected_manifest_hash: Option<&str>,
+    allow_unverified: bool,
 ) -> Result<SnapshotSummary, BoxError> {
     // Read and authenticate the manifest before trusting anything in it.
     let manifest_path = snapshot_dir.join(MANIFEST_FILE_NAME);
     let manifest_bytes = fs::read(&manifest_path)
         .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
 
-    let manifest_hash = hash_bytes(&manifest_bytes);
-    let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes)?;
+    let manifest: SnapshotManifest = parse_manifest(&manifest_bytes)?;
 
-    // Resolve the hash to authenticate against. An explicit `--expect-hash` wins; otherwise
-    // fall back to the hash embedded in this binary for the snapshot's (network, height),
-    // which is trusted like a block checkpoint. Looking it up by the manifest's declared
-    // height is safe: a lying height simply will not match the embedded hash for that height.
-    let effective_hash = match expected_manifest_hash {
-        Some(expected) => Some(("--expect-hash", expected.trim().to_lowercase())),
-        None => trusted_manifest_hash(network, manifest.tip_height)
-            .map(|hash| ("embedded trusted hash", hash)),
-    };
-
-    match &effective_hash {
-        Some((source, expected)) => {
-            if &manifest_hash != expected {
-                return Err(format!(
-                    "snapshot manifest hash mismatch: expected {expected} ({source}), \
-                     got {manifest_hash}. The snapshot may be corrupted or malicious, \
-                     refusing to import."
-                )
-                .into());
-            }
-            tracing::info!(%manifest_hash, source, "snapshot manifest hash verified");
-        }
-        None => {
-            tracing::warn!(
-                %manifest_hash,
-                "importing UNVERIFIED snapshot: no --expect-hash was given and no trusted \
-                 hash is embedded for this network and height. Only do this with snapshots \
-                 you exported yourself."
-            );
-        }
-    }
+    let (manifest_hash, verification) = verify_manifest_hash(
+        network,
+        &manifest_bytes,
+        manifest.tip_height,
+        expected_manifest_hash,
+        allow_unverified,
+    )?;
 
     if manifest.snapshot_format != SNAPSHOT_FORMAT {
         return Err(format!(
@@ -443,12 +542,15 @@ pub fn import_snapshot(
         .into());
     }
 
+    // Require the exact database format version. Same-major-older-minor data would be
+    // stamped with this binary's version file, so the pending minor format upgrades
+    // would never run and the node would silently serve un-migrated data forever.
     let running_version = state_database_format_version_in_code();
     let snapshot_version = Version::parse(&manifest.db_format_version)?;
-    if snapshot_version.major != running_version.major {
+    if snapshot_version != running_version {
         return Err(format!(
-            "database format major version mismatch: snapshot is {snapshot_version}, \
-             this Zebra uses {running_version}. Re-export the snapshot with a matching Zebra."
+            "database format version mismatch: snapshot is {snapshot_version}, this Zebra \
+             uses {running_version}. Use a matching Zebra, or re-export the snapshot."
         )
         .into());
     }
@@ -462,13 +564,23 @@ pub fn import_snapshot(
     let tip_height = block::Height(manifest.tip_height);
     let tip_hash: block::Hash = manifest.tip_hash.parse()?;
 
+    // An ephemeral state generates a fresh temporary path on every `db_path()` call, so
+    // the imported data could never be found again. Refuse it up front.
+    if config.ephemeral {
+        return Err(
+            "cannot import a snapshot into an ephemeral state: disable `ephemeral` in the \
+             [state] config section"
+                .into(),
+        );
+    }
+
     // Refuse to touch an existing database.
-    let db_path = config.db_path(STATE_DATABASE_KIND, running_version.major, network);
-    if db_path.exists() {
+    let final_db_path = config.db_path(STATE_DATABASE_KIND, running_version.major, network);
+    if final_db_path.exists() {
         return Err(format!(
             "target state database already exists, refusing to import over it: {}. \
              Delete it first if you want to replace it with the snapshot.",
-            db_path.display()
+            final_db_path.display()
         )
         .into());
     }
@@ -491,8 +603,23 @@ pub fn import_snapshot(
 
     let start_time = Instant::now();
 
-    let db = ZebraDb::new(
-        config,
+    // Build the database in a temporary directory inside the cache dir (same filesystem)
+    // and rename it into place only after every check passes. This makes the import
+    // atomic: a crash or Ctrl-C can never leave a half-populated database that a later
+    // `zebrad start` would open as real state. It also guarantees the fresh database is
+    // created in a cache directory containing no previous-major database, so
+    // `ZebraDb::new` can never rename-and-reuse an old state underneath the import.
+    fs::create_dir_all(&config.cache_dir)?;
+    let tmp_cache = tempfile::Builder::new()
+        .prefix("zsnap-import-")
+        .tempdir_in(&config.cache_dir)?;
+    let tmp_config = Config {
+        cache_dir: tmp_cache.path().to_path_buf(),
+        ..config.clone()
+    };
+
+    let mut db = ZebraDb::new(
+        &tmp_config,
         STATE_DATABASE_KIND,
         &running_version,
         network,
@@ -503,9 +630,20 @@ pub fn import_snapshot(
         false,
     )?;
 
-    // The format version file is written by a background task for newly created databases.
-    // Wait for it, so an interrupted import can't leave a versionless database behind.
-    wait_for_version_file(config, network, &running_version)?;
+    // Wait for the newly-created database's background format task before writing any
+    // data: its validity checks must see the empty database, not a half-imported one.
+    db.join_format_change_task();
+
+    // Write the version file explicitly: the rename below must never publish a database
+    // without one. The version file lives inside the database directory, so the rename
+    // moves it along with the data.
+    crate::config::hidden::write_database_format_version_to_disk(
+        &tmp_config,
+        STATE_DATABASE_KIND,
+        running_version.major,
+        &running_version,
+        network,
+    )?;
 
     let mut total_records: u64 = 0;
     let mut total_bytes: u64 = 0;
@@ -552,6 +690,24 @@ pub fn import_snapshot(
         .into());
     }
 
+    // Close the database before renaming its directory: RocksDB must not hold open
+    // files across the move.
+    drop(db);
+
+    // Publish atomically. The rename only happens after every verification passed, so
+    // the final path either has a complete verified database or nothing at all.
+    if let Some(parent) = final_db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_db_path = tmp_config.db_path(STATE_DATABASE_KIND, running_version.major, network);
+    fs::rename(&tmp_db_path, &final_db_path).map_err(|e| {
+        format!(
+            "failed to move the imported database into place ({} -> {}): {e}",
+            tmp_db_path.display(),
+            final_db_path.display()
+        )
+    })?;
+
     let elapsed = start_time.elapsed();
     tracing::info!(
         ?tip_height,
@@ -565,6 +721,7 @@ pub fn import_snapshot(
     Ok(SnapshotSummary {
         snapshot_dir: snapshot_dir.to_path_buf(),
         manifest_hash,
+        verification,
         tip_height,
         tip_hash,
         total_records,
@@ -586,6 +743,18 @@ fn check_manifest_column_families(manifest: &SnapshotManifest) -> Result<(), Box
     let expected: BTreeSet<&str> = STATE_COLUMN_FAMILIES_IN_CODE.iter().copied().collect();
     let actual: BTreeSet<&str> = manifest.chunks.iter().map(|c| c.name.as_str()).collect();
 
+    // Reject duplicate chunk entries before comparing sets: a duplicated name would let
+    // a second chunk silently overlay the first while still passing the exact-set check.
+    if manifest.chunks.len() != actual.len() {
+        return Err(format!(
+            "snapshot manifest lists {} chunks but only {} distinct column families; \
+             duplicate chunk entries are not allowed",
+            manifest.chunks.len(),
+            actual.len()
+        )
+        .into());
+    }
+
     if actual == expected {
         return Ok(());
     }
@@ -605,7 +774,10 @@ fn check_manifest_column_families(manifest: &SnapshotManifest) -> Result<(), Box
 /// snapshot directory: absolute paths, `..` components, and (for Windows) rooted-but-
 /// prefixless paths or drive prefixes, which `Path::is_absolute` does not catch but which
 /// `Path::join` would honor.
-fn checked_chunk_path(snapshot_dir: &Path, relative: &str) -> Result<PathBuf, BoxError> {
+///
+/// Exposed so the snapshot downloader uses this exact check instead of its own copy:
+/// a path-traversal fix must never land on one side only.
+pub fn checked_chunk_path(snapshot_dir: &Path, relative: &str) -> Result<PathBuf, BoxError> {
     use std::path::Component;
 
     let path = Path::new(relative);
@@ -723,6 +895,8 @@ fn read_frame(
         .into());
     }
 
+    // Cast is safe: `len` fits in u32 and was bounds-checked against `max_len` above,
+    // and usize is at least 32 bits on all supported targets.
     let mut frame = vec![0u8; len as usize];
     reader.read_exact(&mut frame).map_err(|e| {
         format!(
@@ -732,43 +906,6 @@ fn read_frame(
     })?;
 
     Ok(Some(frame))
-}
-
-/// Waits until the database format version file exists on disk with the running version.
-///
-/// Newly created databases write their version file from a background task.
-fn wait_for_version_file(
-    config: &Config,
-    network: &Network,
-    running_version: &Version,
-) -> Result<(), BoxError> {
-    let deadline = Instant::now() + VERSION_FILE_WAIT;
-
-    loop {
-        let on_disk = database_format_version_on_disk(
-            config,
-            STATE_DATABASE_KIND,
-            running_version.major,
-            network,
-        )?;
-
-        if let Some(version) = &on_disk {
-            if version.major == running_version.major {
-                return Ok(());
-            }
-        }
-
-        if Instant::now() > deadline {
-            return Err(format!(
-                "timed out waiting for the database format version file, \
-                 last saw {on_disk:?}, expected major version {}",
-                running_version.major
-            )
-            .into());
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 #[cfg(test)]
@@ -840,9 +977,26 @@ mod tests {
             "mainnet has no blessed snapshot yet"
         );
         assert_eq!(
-            parse_snapshot_hashes(TESTNET_SNAPSHOT_HASHES).count(),
+            parse_snapshot_hashes(TESTNET_SNAPSHOT_HASHES)
+                .expect("the shipped testnet hash list is well formed")
+                .len(),
             1,
             "the parser skips comments and blank lines"
+        );
+        assert!(
+            parse_snapshot_hashes(MAINNET_SNAPSHOT_HASHES).is_ok(),
+            "the shipped mainnet hash list is well formed"
+        );
+
+        // Malformed lines are hard errors, not silently dropped trust anchors.
+        assert!(parse_snapshot_hashes("75200 nothex").is_err());
+        assert!(parse_snapshot_hashes("notanumber a5db82a2").is_err());
+        assert!(parse_snapshot_hashes("75200").is_err());
+
+        // Regtest and custom testnets never resolve public-testnet hashes.
+        assert!(
+            trusted_manifest_hash(&Network::new_regtest(Default::default()), 75200).is_none(),
+            "regtest must not trust public-testnet snapshot hashes"
         );
     }
 

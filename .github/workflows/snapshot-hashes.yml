@@ -1,13 +1,17 @@
 # Regenerate the trusted zsnap snapshot-hash lists and open a review PR.
 #
 # This is the snapshot analogue of checkpoint-update.yml. It exports a snapshot from a
-# fully-synced node at a recent, stable height, records the manifest hash, and opens a pull
+# synced state cache present on the runner, records the manifest hash, and opens a pull
 # request updating zebra-state/src/snapshot/<network>-snapshot-hashes.txt. The PR requires
 # human review and is only merged after independent reproducible-hash attestations agree
 # (see the attestations process). The trust root is therefore this reviewed, signed in-tree
 # list, produced by the project's own CI, not any single publisher.
 #
 # It never commits to a branch directly and never blesses a hash on its own.
+#
+# Runner requirement: a synced Zebra state cache for the chosen network must already exist
+# at `cache_dir` (a self-hosted runner with a long-running node, or a restored CI cache).
+# The workflow fails fast with a clear error when it is missing.
 
 name: Update snapshot hashes
 
@@ -18,10 +22,10 @@ on:
         description: "Network to regenerate for (Mainnet or Testnet)"
         required: true
         default: "Testnet"
-      height:
-        description: "Finalized height to pin the snapshot at (leave blank for tip)"
+      cache_dir:
+        description: "Path to the synced Zebra state cache directory on the runner"
         required: false
-        default: ""
+        default: "~/.cache/zebra"
   schedule:
     # Monthly, so a fresh candidate snapshot is always available for review.
     - cron: "0 6 1 * *"
@@ -37,27 +41,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Validate the only free-form input up front, so nothing downstream interpolates an
+      # Validate the free-form inputs up front, so nothing downstream interpolates an
       # unexpected value into a shell command.
-      - name: Validate network input
+      - name: Validate inputs and locate the state cache
         env:
           NETWORK: ${{ inputs.network || 'Testnet' }}
+          CACHE_DIR_INPUT: ${{ inputs.cache_dir || '~/.cache/zebra' }}
         run: |
           set -euo pipefail
           case "$NETWORK" in
             Mainnet|Testnet) ;;
             *) echo "network must be Mainnet or Testnet, got: $NETWORK" >&2; exit 1 ;;
           esac
+          # Expand a leading ~ without eval.
+          CACHE_DIR="${CACHE_DIR_INPUT/#\~/$HOME}"
+          if [ ! -d "$CACHE_DIR" ]; then
+            echo "no synced state cache at $CACHE_DIR on this runner." >&2
+            echo "This workflow needs a runner with a synced Zebra state for $NETWORK." >&2
+            exit 1
+          fi
+          echo "CACHE_DIR=$CACHE_DIR" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-
-      # Uses the same cached-state disks the rest of Zebra CI relies on, so no full sync is
-      # needed here. See the cached-state workflows.
-      - name: Fetch a synced state cache
-        env:
-          NETWORK: ${{ inputs.network || 'Testnet' }}
-        run: ./.github/workflows/scripts/gcp-get-cached-disks.sh "$NETWORK"
 
       - name: Build zebrad
         run: cargo build --release -p zebrad

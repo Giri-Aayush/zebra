@@ -19,7 +19,7 @@ use clap::Parser;
 use color_eyre::eyre::{eyre, Result};
 
 use zebra_chain::parameters::Network;
-use zebra_state::snapshot::import_snapshot;
+use zebra_state::snapshot::{import_snapshot, VerificationSource};
 
 use super::snapshot_download::download_snapshot;
 use crate::prelude::APPLICATION;
@@ -28,10 +28,8 @@ use crate::prelude::APPLICATION;
 #[derive(Command, Debug, Default, Parser)]
 pub struct ImportSnapshotCmd {
     /// Directory containing the snapshot (with a MANIFEST.json).
-    #[clap(
-        help = "directory containing the snapshot to import \
-                (with --url, the directory to download it into)"
-    )]
+    #[clap(help = "directory containing the snapshot to import \
+                (with --url, the directory to download it into)")]
     snapshot_dir: PathBuf,
 
     /// Base URL to download the snapshot from before importing.
@@ -48,9 +46,18 @@ pub struct ImportSnapshotCmd {
         long,
         help = "expected snapshot manifest hash from a trusted source. If omitted, the hash \
                 embedded in this binary for the snapshot's network and height is used (like a \
-                block checkpoint); if there is none, the snapshot is NOT authenticated"
+                block checkpoint); if there is none either, the import is refused unless \
+                --allow-unverified is passed"
     )]
     expect_hash: Option<String>,
+
+    /// Allow importing a snapshot that cannot be authenticated.
+    #[clap(
+        long,
+        help = "allow an import with no --expect-hash and no embedded trusted hash. \
+                ONLY use this with snapshots you exported yourself"
+    )]
+    allow_unverified: bool,
 
     /// Path to Zebra's cached state, overriding the config file.
     #[clap(long, short, help = "path to directory for the new Zebra chain state")]
@@ -93,7 +100,13 @@ impl ImportSnapshotCmd {
         // authenticates the manifest first (when --expect-hash is given) and verifies
         // every chunk, and reruns resume partial chunks instead of starting over.
         if let Some(url) = &self.url {
-            download_snapshot(url, &network, &self.snapshot_dir, self.expect_hash.as_deref())?;
+            download_snapshot(
+                url,
+                &network,
+                &self.snapshot_dir,
+                self.expect_hash.as_deref(),
+                self.allow_unverified,
+            )?;
         }
 
         let summary = import_snapshot(
@@ -101,6 +114,7 @@ impl ImportSnapshotCmd {
             &network,
             &self.snapshot_dir,
             self.expect_hash.as_deref(),
+            self.allow_unverified,
         )
         .map_err(|e| eyre!(e))?;
 
@@ -110,8 +124,11 @@ impl ImportSnapshotCmd {
         println!("tip hash:               {}", summary.tip_hash);
         println!("total records:          {}", summary.total_records);
         println!("manifest hash:          {}", summary.manifest_hash);
+        // Report what actually happened, not what flags were passed: the library may
+        // have authenticated against the embedded trusted hash without --expect-hash.
+        println!("verification:           {}", summary.verification);
 
-        if self.expect_hash.is_none() {
+        if summary.verification == VerificationSource::Unverified {
             println!();
             println!(
                 "WARNING: this import was NOT authenticated. \

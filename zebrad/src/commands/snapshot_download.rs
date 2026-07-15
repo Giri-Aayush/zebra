@@ -24,15 +24,16 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{eyre, Result};
 
-use zebra_chain::parameters::Network;
+use zebra_chain::{common::atomic_write, parameters::Network};
 use zebra_state::snapshot::{
-    hash_bytes, hash_file, parse_manifest, trusted_manifest_hash, MANIFEST_FILE_NAME,
+    checked_chunk_path, hash_file, parse_manifest, verify_manifest_hash, MANIFEST_FILE_NAME,
+    SNAPSHOT_FORMAT,
 };
 
 /// How long to wait for a TCP connect before giving up.
@@ -69,13 +70,14 @@ const PART_EXT: &str = "part";
 ///
 /// The manifest is authenticated before any chunk is downloaded, against `expected_hash` if
 /// given, otherwise against the hash embedded in the binary for this `network` and the
-/// snapshot's height. Only if neither is available is the download *unverified* (the
-/// importer will warn again at import time).
+/// snapshot's height. When neither is available the download is refused, unless the
+/// operator passed `allow_unverified`.
 pub fn download_snapshot(
     base_url: &str,
     network: &Network,
     dest: &Path,
     expected_hash: Option<&str>,
+    allow_unverified: bool,
 ) -> Result<()> {
     let base = base_url.trim_end_matches('/');
     let config = ureq::Agent::config_builder()
@@ -105,35 +107,32 @@ pub fn download_snapshot(
     }
     let manifest_bytes = response.body_mut().read_to_vec()?;
 
-    let manifest_hash = hash_bytes(&manifest_bytes);
     let manifest = parse_manifest(&manifest_bytes).map_err(|e| eyre!(e))?;
 
-    // Authenticate the manifest before downloading any chunk. Prefer an explicit
-    // --expect-hash; otherwise fall back to the hash embedded for this network and the
-    // snapshot's declared height, which is trusted like a block checkpoint.
-    let effective_hash = match expected_hash {
-        Some(expected) => Some(("--expect-hash", expected.trim().to_lowercase())),
-        None => trusted_manifest_hash(network, manifest.tip_height)
-            .map(|hash| ("embedded trusted hash", hash)),
-    };
-    match &effective_hash {
-        Some((source, expected)) => {
-            if &manifest_hash != expected {
-                return Err(eyre!(
-                    "downloaded manifest hash mismatch: expected {expected} ({source}), \
-                     got {manifest_hash}. Wrong snapshot or tampered manifest, refusing to \
-                     download chunks."
-                ));
-            }
-            tracing::info!(%manifest_hash, source, "downloaded manifest hash verified");
-        }
-        None => {
-            tracing::warn!(
-                %manifest_hash,
-                "downloading UNVERIFIED snapshot: no --expect-hash and no embedded trusted \
-                 hash for this network and height"
-            );
-        }
+    // Authenticate the manifest before downloading any chunk, using the same trust
+    // policy as import: explicit hash, else embedded trusted hash, else hard-fail
+    // unless the operator explicitly allowed an unverified download.
+    verify_manifest_hash(
+        network,
+        &manifest_bytes,
+        manifest.tip_height,
+        expected_hash,
+        allow_unverified,
+    )
+    .map_err(|e| eyre!(e))?;
+
+    // Reject snapshots the import step would refuse anyway, before spending bandwidth.
+    if manifest.snapshot_format != SNAPSHOT_FORMAT {
+        return Err(eyre!(
+            "unsupported snapshot format {}: this Zebra supports format {SNAPSHOT_FORMAT}",
+            manifest.snapshot_format
+        ));
+    }
+    if manifest.network != network.to_string() {
+        return Err(eyre!(
+            "network mismatch: snapshot is for {}, configured network is {network}",
+            manifest.network
+        ));
     }
 
     // Trust-independent sanity bounds. In unverified mode the manifest is attacker
@@ -146,7 +145,13 @@ pub fn download_snapshot(
             manifest.chunks.len()
         ));
     }
-    let total_bytes: u64 = manifest.chunks.iter().map(|c| c.bytes).sum();
+    // Checked sum: the per-chunk sizes are untrusted, and a wrapping sum could sneak a
+    // huge chunk past the total-size cap.
+    let total_bytes = manifest
+        .chunks
+        .iter()
+        .try_fold(0u64, |acc, c| acc.checked_add(c.bytes))
+        .ok_or_else(|| eyre!("manifest chunk sizes overflow; refusing to download"))?;
     if total_bytes > MAX_TOTAL_BYTES {
         return Err(eyre!(
             "manifest declares {total_bytes} bytes, more than the {MAX_TOTAL_BYTES} byte limit; \
@@ -154,7 +159,10 @@ pub fn download_snapshot(
         ));
     }
 
-    fs::write(dest.join(MANIFEST_FILE_NAME), &manifest_bytes)?;
+    // Write the manifest atomically, so an interrupted download can't leave a truncated
+    // manifest that wedges later reruns.
+    atomic_write(dest.join(MANIFEST_FILE_NAME), &manifest_bytes)?
+        .map_err(|e| eyre!("failed to persist manifest: {e}"))?;
 
     let total_chunks = manifest.chunks.len();
     tracing::info!(
@@ -167,8 +175,7 @@ pub fn download_snapshot(
 
     let start = Instant::now();
     for (index, chunk) in manifest.chunks.iter().enumerate() {
-        let relative = checked_relative_path(&chunk.file)?;
-        let final_path = dest.join(&relative);
+        let final_path = checked_chunk_path(dest, &chunk.file).map_err(|e| eyre!(e))?;
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -282,8 +289,14 @@ fn download_chunk(
         if n == 0 {
             break;
         }
-        // Bound writes by the manifest's size so a misbehaving server cannot fill the disk.
-        if written + n as u64 > expected_bytes {
+        // Bound writes by the manifest's size so a misbehaving server cannot fill the
+        // disk. Checked add: `expected_bytes` is untrusted, so the guard itself must not
+        // be bypassable by overflow. The `n as u64` casts are safe because `n` is a
+        // buffer read length bounded by COPY_BUF_BYTES, far below u64::MAX.
+        let after_write = written
+            .checked_add(n as u64)
+            .ok_or_else(|| eyre!("{label}: downloaded byte count overflow"))?;
+        if after_write > expected_bytes {
             drop(file);
             fs::remove_file(part_path).ok();
             return Err(eyre!(
@@ -292,7 +305,7 @@ fn download_chunk(
             ));
         }
         file.write_all(&buf[..n])?;
-        written += n as u64;
+        written = after_write;
     }
     file.flush()?;
     drop(file);
@@ -316,23 +329,4 @@ fn download_chunk(
 
     fs::rename(part_path, final_path)?;
     Ok(())
-}
-
-/// Resolves a manifest-relative chunk path, rejecting anything that could escape the
-/// download directory in a hostile manifest: absolute paths, `..` components, and
-/// (for Windows) rooted-but-prefixless paths like `\foo` or drive prefixes like `C:foo`,
-/// which `Path::is_absolute` does not catch but which `PathBuf::join` would honor.
-fn checked_relative_path(relative: &str) -> Result<PathBuf> {
-    let path = Path::new(relative);
-    let escapes = path.is_absolute()
-        || path.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        });
-    if escapes {
-        return Err(eyre!("invalid chunk path in manifest: {relative}"));
-    }
-    Ok(path.to_path_buf())
 }

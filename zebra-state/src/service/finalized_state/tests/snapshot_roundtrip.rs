@@ -58,11 +58,16 @@ async fn snapshot_export_import_roundtrip() {
         .zcash_deserialize_into()
         .expect("hard-coded genesis block bytes are valid");
 
-    let source_dir = tempfile::tempdir().expect("temp dir");
-    let import_dir = tempfile::tempdir().expect("temp dir");
-    let snap_a = tempfile::tempdir().expect("temp dir");
-    let snap_b = tempfile::tempdir().expect("temp dir");
-    let snap_c = tempfile::tempdir().expect("temp dir");
+    let source_dir =
+        tempfile::tempdir().expect("creating a temp dir in the system temp location succeeds");
+    let import_dir =
+        tempfile::tempdir().expect("creating a temp dir in the system temp location succeeds");
+    let snap_a =
+        tempfile::tempdir().expect("creating a temp dir in the system temp location succeeds");
+    let snap_b =
+        tempfile::tempdir().expect("creating a temp dir in the system temp location succeeds");
+    let snap_c =
+        tempfile::tempdir().expect("creating a temp dir in the system temp location succeeds");
 
     let source_config = on_disk_config(source_dir.path());
 
@@ -125,11 +130,23 @@ async fn snapshot_export_import_roundtrip() {
     let import_config = on_disk_config(import_dir.path());
     let (cfg, net, dir) = (import_config.clone(), network.clone(), export_a_dir.clone());
     let rejected = tokio::task::spawn_blocking(move || {
-        import_snapshot(&cfg, &net, &dir, Some(WRONG_MANIFEST_HASH))
+        import_snapshot(&cfg, &net, &dir, Some(WRONG_MANIFEST_HASH), false)
     })
     .await
     .expect("import task should not panic");
     assert!(rejected.is_err(), "a wrong manifest hash must be rejected");
+
+    // 3b. With no expected hash, no embedded hash for this height, and no explicit
+    // opt-in, the import is refused outright: unverified must never be a silent default.
+    let (cfg, net, dir) = (import_config.clone(), network.clone(), export_a_dir.clone());
+    let refused =
+        tokio::task::spawn_blocking(move || import_snapshot(&cfg, &net, &dir, None, false))
+            .await
+            .expect("import task should not panic");
+    assert!(
+        refused.is_err(),
+        "an unauthenticatable import must be refused without --allow-unverified"
+    );
 
     // 4. Authenticated import into a fresh database.
     let (cfg, net, dir, hash) = (
@@ -138,12 +155,16 @@ async fn snapshot_export_import_roundtrip() {
         export_a_dir.clone(),
         summary_a.manifest_hash.clone(),
     );
-    let imported = tokio::task::spawn_blocking(move || {
-        import_snapshot(&cfg, &net, &dir, Some(&hash))
-    })
-    .await
-    .expect("import task should not panic")
-    .expect("authenticated import should succeed");
+    let imported =
+        tokio::task::spawn_blocking(move || import_snapshot(&cfg, &net, &dir, Some(&hash), false))
+            .await
+            .expect("import task should not panic")
+            .expect("authenticated import should succeed");
+    assert_eq!(
+        imported.verification,
+        crate::snapshot::VerificationSource::ExplicitHash,
+        "the summary must report how the manifest was verified"
+    );
     assert_eq!(imported.tip_height, Height(0));
     assert_eq!(imported.tip_hash, expected_tip_hash);
     assert_eq!(imported.total_records, summary_a.total_records);
