@@ -10,13 +10,19 @@ use crate::config::ZebradConfig;
 
 pub use self::{entry_point::EntryPoint, start::StartCmd};
 
-use self::{copy_state::CopyStateCmd, generate::GenerateCmd, tip_height::TipHeightCmd};
+use self::{
+    copy_state::CopyStateCmd, export_snapshot::ExportSnapshotCmd, generate::GenerateCmd,
+    import_snapshot::ImportSnapshotCmd, tip_height::TipHeightCmd,
+};
 
 pub mod start;
 
 mod copy_state;
 mod entry_point;
+mod export_snapshot;
 mod generate;
+mod import_snapshot;
+mod snapshot_download;
 mod tip_height;
 
 #[cfg(test)]
@@ -34,8 +40,14 @@ pub enum ZebradCmd {
     // TODO: hide this command from users in release builds (#3279)
     CopyState(CopyStateCmd),
 
+    /// Export a verifiable snapshot of Zebra's finalized chain state
+    ExportSnapshot(ExportSnapshotCmd),
+
     /// Generate a default `zebrad.toml` configuration
     Generate(GenerateCmd),
+
+    /// Import a snapshot of Zebra's finalized chain state into a fresh state directory
+    ImportSnapshot(ImportSnapshotCmd),
 
     /// Start the application (default command)
     Start(StartCmd),
@@ -57,7 +69,7 @@ impl ZebradCmd {
             CopyState(_) | Start(_) => true,
 
             // Utility commands that don't use server components
-            Generate(_) | TipHeight(_) => false,
+            ExportSnapshot(_) | Generate(_) | ImportSnapshot(_) | TipHeight(_) => false,
         }
     }
 
@@ -71,7 +83,9 @@ impl ZebradCmd {
             Start(_) => true,
 
             // Utility commands
-            CopyState(_) | Generate(_) | TipHeight(_) => false,
+            CopyState(_) | ExportSnapshot(_) | Generate(_) | ImportSnapshot(_) | TipHeight(_) => {
+                false
+            }
         }
     }
 
@@ -93,7 +107,7 @@ impl ZebradCmd {
             Generate(_) | TipHeight(_) => true,
 
             // Commands that generate informative logging output by default.
-            CopyState(_) | Start(_) => false,
+            CopyState(_) | ExportSnapshot(_) | ImportSnapshot(_) | Start(_) => false,
         };
 
         if only_show_warnings && !verbose {
@@ -110,7 +124,9 @@ impl Runnable for ZebradCmd {
     fn run(&self) {
         match self {
             CopyState(cmd) => cmd.run(),
+            ExportSnapshot(cmd) => cmd.run(),
             Generate(cmd) => cmd.run(),
+            ImportSnapshot(cmd) => cmd.run(),
             Start(cmd) => cmd.run(),
             TipHeight(cmd) => cmd.run(),
         }

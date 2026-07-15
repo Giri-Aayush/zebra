@@ -181,6 +181,7 @@ lazy_static = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 toml = { workspace = true }
+ureq = { workspace = true }
 
 futures = { workspace = true }
 rayon = { workspace = true }
