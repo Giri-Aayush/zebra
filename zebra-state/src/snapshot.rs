@@ -56,11 +56,24 @@ use crate::{
 /// A boxed error for snapshot operations.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// The version of the snapshot directory layout and chunk framing format.
-pub const SNAPSHOT_FORMAT: u32 = 1;
+/// The version of the snapshot directory layout and hashing scheme.
+///
+/// Bumped to 2 when the snapshot's identity moved from a hash of the whole manifest to the
+/// canonical hash over consensus-critical column families only (see
+/// [`canonical_manifest_hash`] and benchmarks/differential-75600.md).
+pub const SNAPSHOT_FORMAT: u32 = 2;
 
 /// The magic bytes at the start of every chunk file.
 const CHUNK_MAGIC: &[u8; 8] = b"ZSNAPv1\n";
+
+/// Column families excluded from the canonical snapshot hash.
+///
+/// These hold non-consensus, block-derived metadata (reconstructable from the blocks) that
+/// can legitimately differ between an independently-synced node and a snapshot-bootstrapped
+/// one, so including them would stop two honest nodes at the same height from agreeing on the
+/// hash. They are still exported, imported, and per-chunk hash-verified; they just do not
+/// define the snapshot's identity. See benchmarks/differential-75600.md.
+pub const NON_CONSENSUS_COLUMN_FAMILIES: &[&str] = &["block_info"];
 
 /// The manifest file name inside a snapshot directory.
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST.json";
@@ -256,23 +269,59 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<SnapshotManifest, BoxError> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
+/// The canonical hash that is a snapshot's identity: a BLAKE2b-256 over a deterministic,
+/// language-agnostic text covering the snapshot's identity fields and the per-chunk hashes of
+/// the consensus-critical column families only (excluding [`NON_CONSENSUS_COLUMN_FAMILIES`]).
+///
+/// Because it is a function of consensus state alone, two honest nodes at the same height
+/// produce the same value, which is what the embedded trusted hashes and the reproducible
+/// attestations rely on. The exact text is mirrored by `attestations/verify.sh` so an
+/// independent tool can recompute it.
+pub fn canonical_manifest_hash(manifest: &SnapshotManifest) -> String {
+    use std::fmt::Write;
+
+    let mut s = String::new();
+    s.push_str("zsnap-canonical-v2\n");
+    let _ = writeln!(s, "network={}", manifest.network);
+    let _ = writeln!(s, "tip_height={}", manifest.tip_height);
+    let _ = writeln!(s, "tip_hash={}", manifest.tip_hash);
+    let _ = writeln!(s, "db_format_version={}", manifest.db_format_version);
+    let _ = writeln!(s, "snapshot_format={}", manifest.snapshot_format);
+
+    let mut chunks: Vec<&ChunkEntry> = manifest
+        .chunks
+        .iter()
+        .filter(|c| !NON_CONSENSUS_COLUMN_FAMILIES.contains(&c.name.as_str()))
+        .collect();
+    chunks.sort_by(|a, b| a.name.cmp(&b.name));
+    for c in chunks {
+        let _ = writeln!(
+            s,
+            "chunk={},{},{},{}",
+            c.name, c.records, c.bytes, c.blake2b256
+        );
+    }
+
+    hash_bytes(s.as_bytes())
+}
+
 /// Resolves and enforces the manifest trust policy, shared by import and download.
 ///
 /// An explicit `expected_hash` wins; otherwise the hash embedded in this binary for the
 /// snapshot's (network, declared height) is used, like a block checkpoint. When neither
-/// exists this is a hard error unless `allow_unverified` is set: the manifest author
-/// chooses the declared height, so silently proceeding would let a hostile publisher pick
-/// any non-blessed height and bypass verification entirely.
+/// exists this is a hard error unless `allow_unverified` is set: the manifest author chooses
+/// the declared height, so silently proceeding would let a hostile publisher pick any
+/// non-blessed height and bypass verification entirely.
 ///
 /// Returns the manifest hash and how it was verified.
 pub fn verify_manifest_hash(
     network: &Network,
-    manifest_bytes: &[u8],
-    declared_height: u32,
+    manifest: &SnapshotManifest,
     expected_hash: Option<&str>,
     allow_unverified: bool,
 ) -> Result<(String, VerificationSource), BoxError> {
-    let manifest_hash = hash_bytes(manifest_bytes);
+    let declared_height = manifest.tip_height;
+    let manifest_hash = canonical_manifest_hash(manifest);
 
     let (source, expected) = match expected_hash {
         Some(expected) => (
@@ -472,7 +521,7 @@ pub fn export_snapshot(
     zebra_chain::common::atomic_write(manifest_path.clone(), &manifest_bytes)?
         .map_err(|e| format!("failed to persist manifest: {e}"))?;
 
-    let manifest_hash = hash_bytes(&manifest_bytes);
+    let manifest_hash = canonical_manifest_hash(&manifest);
 
     let elapsed = start_time.elapsed();
     tracing::info!(
@@ -520,8 +569,7 @@ pub fn import_snapshot(
 
     let (manifest_hash, verification) = verify_manifest_hash(
         network,
-        &manifest_bytes,
-        manifest.tip_height,
+        &manifest,
         expected_manifest_hash,
         allow_unverified,
     )?;
@@ -1127,16 +1175,67 @@ mod tests {
             }],
         };
 
-        let hash_manifest = |m: &SnapshotManifest| -> String {
-            snapshot_hash(&serde_json::to_vec_pretty(m).unwrap())
-        };
+        // Reproducibility: identical manifest -> identical canonical hash.
+        assert_eq!(
+            canonical_manifest_hash(&manifest),
+            canonical_manifest_hash(&manifest.clone())
+        );
 
-        // Reproducibility: identical manifest -> identical published hash.
-        assert_eq!(hash_manifest(&manifest), hash_manifest(&manifest.clone()));
-
-        // Tamper-evidence: flipping one chunk hash changes the manifest hash.
+        // Tamper-evidence: flipping a consensus chunk's hash changes the canonical hash.
         let mut tampered = manifest.clone();
         tampered.chunks[0].blake2b256 = "00".repeat(32);
-        assert_ne!(hash_manifest(&manifest), hash_manifest(&tampered));
+        assert_ne!(
+            canonical_manifest_hash(&manifest),
+            canonical_manifest_hash(&tampered)
+        );
+    }
+
+    /// The canonical hash excludes non-consensus column families: a difference in
+    /// `block_info` does not change it (so two independently-built nodes converge), but a
+    /// difference in a consensus column family does. This is the fix for the divergence
+    /// found by the from-genesis differential test.
+    #[test]
+    fn canonical_hash_ignores_non_consensus_metadata() {
+        let base = SnapshotManifest {
+            snapshot_format: SNAPSHOT_FORMAT,
+            db_format_version: "28.0.0".to_string(),
+            network: "Testnet".to_string(),
+            tip_height: 75_600,
+            tip_hash: "0".repeat(64),
+            chunks: vec![
+                ChunkEntry {
+                    name: "sapling_note_commitment_tree".to_string(),
+                    file: "chunks/sapling_note_commitment_tree.zsnap".to_string(),
+                    records: 1,
+                    bytes: 53,
+                    blake2b256: "aa".repeat(32),
+                },
+                ChunkEntry {
+                    name: "block_info".to_string(),
+                    file: "chunks/block_info.zsnap".to_string(),
+                    records: 75_601,
+                    bytes: 4_000_000,
+                    blake2b256: "bb".repeat(32),
+                },
+            ],
+        };
+
+        // Same consensus state, different block_info hash -> identical canonical hash.
+        let mut other_block_info = base.clone();
+        other_block_info.chunks[1].blake2b256 = "cc".repeat(32);
+        assert_eq!(
+            canonical_manifest_hash(&base),
+            canonical_manifest_hash(&other_block_info),
+            "block_info must not affect the canonical hash"
+        );
+
+        // Changing the consensus chunk DOES change the canonical hash.
+        let mut other_consensus = base.clone();
+        other_consensus.chunks[0].blake2b256 = "dd".repeat(32);
+        assert_ne!(
+            canonical_manifest_hash(&base),
+            canonical_manifest_hash(&other_consensus),
+            "a consensus column family must affect the canonical hash"
+        );
     }
 }

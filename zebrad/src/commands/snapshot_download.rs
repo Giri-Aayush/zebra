@@ -112,14 +112,8 @@ pub fn download_snapshot(
     // Authenticate the manifest before downloading any chunk, using the same trust
     // policy as import: explicit hash, else embedded trusted hash, else hard-fail
     // unless the operator explicitly allowed an unverified download.
-    verify_manifest_hash(
-        network,
-        &manifest_bytes,
-        manifest.tip_height,
-        expected_hash,
-        allow_unverified,
-    )
-    .map_err(|e| eyre!(e))?;
+    verify_manifest_hash(network, &manifest, expected_hash, allow_unverified)
+        .map_err(|e| eyre!(e))?;
 
     // Reject snapshots the import step would refuse anyway, before spending bandwidth.
     if manifest.snapshot_format != SNAPSHOT_FORMAT {

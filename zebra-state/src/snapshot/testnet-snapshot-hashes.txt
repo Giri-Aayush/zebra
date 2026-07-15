@@ -8,4 +8,4 @@
 # not any single publisher. An entry is added only after independent reproducible-hash
 # attestations agree at that height (see the attestations process in the zsnap repo).
 #
-75200 a5db82a2b922f0d402b737088e824153aa15285959044199ee3554667f320666
+75200 db96b2e14c04a9a3b5dc694fb0b0e5adeb77d2fb3d3515d0baf24a1dfabb0571
