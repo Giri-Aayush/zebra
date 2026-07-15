@@ -1,0 +1,88 @@
+# Bootstrap CI cached state from a VERIFIED zsnap snapshot.
+#
+# Zebra CI today restores an opaque, unverified Google Cloud disk image (see
+# gcp-get-cached-disks.sh), keyed by the database state version and network. This workflow
+# does the same job from a verified zsnap snapshot instead: it imports the snapshot over
+# --url into the state cache, authenticated against the hash embedded in the binary for this
+# network and height, so the state a test runs against is consensus-checked rather than
+# trusted blindly, and the artifact is portable to any object store rather than GCP-locked.
+#
+# It reuses the same state-version keying the existing cached-disk scripts use, so a snapshot
+# is only fetched for a matching database format.
+
+name: CI cached state from a verified snapshot
+
+on:
+  workflow_call:
+    inputs:
+      network:
+        description: "Network to bootstrap (Mainnet or Testnet)"
+        type: string
+        required: true
+      snapshot_base_url:
+        description: "Base URL serving <url>/MANIFEST.json and <url>/chunks/..."
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      network:
+        type: string
+        required: true
+        default: "Testnet"
+      snapshot_base_url:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    name: Import verified snapshot into the CI state cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate network input
+        env:
+          NETWORK: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+          case "$NETWORK" in
+            Mainnet|Testnet) ;;
+            *) echo "network must be Mainnet or Testnet, got: $NETWORK" >&2; exit 1 ;;
+          esac
+
+      - name: Extract the database state version
+        id: state
+        run: |
+          set -euo pipefail
+          # Same source of truth as gcp-get-cached-disks.sh, so we never mix formats.
+          VERSION=$(grep -oE "DATABASE_FORMAT_VERSION: .* [0-9]+" zebra-state/src/constants.rs | grep -oE "[0-9]+" | tail -n1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build zebrad
+        run: cargo build --release -p zebrad
+
+      - name: Import the verified snapshot into the cache
+        env:
+          NETWORK: ${{ inputs.network }}
+          # The base URL is a workflow input from a trusted caller; still passed via env, not
+          # interpolated into the command line.
+          BASE_URL: ${{ inputs.snapshot_base_url }}
+          STATE_VERSION: ${{ steps.state.outputs.version }}
+        run: |
+          set -euo pipefail
+          CACHE_DIR="$HOME/.cache/zebra"
+          # No --expect-hash: the hash embedded for this network and the snapshot's height is
+          # the trust anchor, so a wrong or tampered snapshot is rejected here in CI.
+          ./target/release/zebrad import-snapshot "$CACHE_DIR" \
+            --url "$BASE_URL" --cache-dir "$CACHE_DIR" --network "$NETWORK"
+          echo "Imported a verified snapshot for $NETWORK at state version $STATE_VERSION."
+
+      # Downstream test jobs now run against $HOME/.cache/zebra, exactly as they would against
+      # a restored GCP disk image, but with a state that was consensus-verified on import.

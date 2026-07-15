@@ -1,0 +1,107 @@
+# Regenerate the trusted zsnap snapshot-hash lists and open a review PR.
+#
+# This is the snapshot analogue of checkpoint-update.yml. It exports a snapshot from a
+# fully-synced node at a recent, stable height, records the manifest hash, and opens a pull
+# request updating zebra-state/src/snapshot/<network>-snapshot-hashes.txt. The PR requires
+# human review and is only merged after independent reproducible-hash attestations agree
+# (see the attestations process). The trust root is therefore this reviewed, signed in-tree
+# list, produced by the project's own CI, not any single publisher.
+#
+# It never commits to a branch directly and never blesses a hash on its own.
+
+name: Update snapshot hashes
+
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Network to regenerate for (Mainnet or Testnet)"
+        required: true
+        default: "Testnet"
+      height:
+        description: "Finalized height to pin the snapshot at (leave blank for tip)"
+        required: false
+        default: ""
+  schedule:
+    # Monthly, so a fresh candidate snapshot is always available for review.
+    - cron: "0 6 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  regenerate:
+    name: Export snapshot and propose a hash update
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+
+      # Validate the only free-form input up front, so nothing downstream interpolates an
+      # unexpected value into a shell command.
+      - name: Validate network input
+        env:
+          NETWORK: ${{ inputs.network || 'Testnet' }}
+        run: |
+          set -euo pipefail
+          case "$NETWORK" in
+            Mainnet|Testnet) ;;
+            *) echo "network must be Mainnet or Testnet, got: $NETWORK" >&2; exit 1 ;;
+          esac
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Uses the same cached-state disks the rest of Zebra CI relies on, so no full sync is
+      # needed here. See the cached-state workflows.
+      - name: Fetch a synced state cache
+        env:
+          NETWORK: ${{ inputs.network || 'Testnet' }}
+        run: ./.github/workflows/scripts/gcp-get-cached-disks.sh "$NETWORK"
+
+      - name: Build zebrad
+        run: cargo build --release -p zebrad
+
+      - name: Export the snapshot
+        id: export
+        env:
+          NETWORK: ${{ inputs.network || 'Testnet' }}
+        run: |
+          set -euo pipefail
+          ./target/release/zebrad export-snapshot ./candidate \
+            --cache-dir "$CACHE_DIR" --network "$NETWORK" | tee export.log
+          echo "hash=$(grep 'manifest hash:' export.log | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
+          echo "height=$(grep 'tip height:' export.log | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
+
+      - name: Append the candidate hash to the in-tree list
+        env:
+          NETWORK: ${{ inputs.network || 'Testnet' }}
+          HEIGHT: ${{ steps.export.outputs.height }}
+          HASH: ${{ steps.export.outputs.hash }}
+        run: |
+          set -euo pipefail
+          # Belt and braces: the hash and height come from our own build's output, but
+          # validate their shape before writing them into a tracked file.
+          [[ "$HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "unexpected hash: $HASH" >&2; exit 1; }
+          [[ "$HEIGHT" =~ ^[0-9]+$ ]] || { echo "unexpected height: $HEIGHT" >&2; exit 1; }
+          if [ "$NETWORK" = "Mainnet" ]; then FILE="zebra-state/src/snapshot/mainnet-snapshot-hashes.txt";
+          else FILE="zebra-state/src/snapshot/testnet-snapshot-hashes.txt"; fi
+          echo "$HEIGHT $HASH" >> "$FILE"
+
+      - name: Open a review PR (never merges on its own)
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: "snapshot-hashes/${{ inputs.network }}-${{ steps.export.outputs.height }}"
+          title: "Add ${{ inputs.network }} snapshot hash at height ${{ steps.export.outputs.height }}"
+          body: |
+            Candidate trusted snapshot hash produced by CI.
+
+            - Network: ${{ inputs.network }}
+            - Height: ${{ steps.export.outputs.height }}
+            - Manifest hash: `${{ steps.export.outputs.hash }}`
+
+            DO NOT MERGE until independent reproducible-hash attestations agree on this exact
+            hash at this height (see the attestations process). This PR only proposes; a human
+            reviewer and the signed release pipeline bless the value.
+          labels: "C-feature, A-state, do-not-merge-yet"
+          delete-branch: true
