@@ -567,12 +567,8 @@ pub fn import_snapshot(
 
     let manifest: SnapshotManifest = parse_manifest(&manifest_bytes)?;
 
-    let (manifest_hash, verification) = verify_manifest_hash(
-        network,
-        &manifest,
-        expected_manifest_hash,
-        allow_unverified,
-    )?;
+    let (manifest_hash, verification) =
+        verify_manifest_hash(network, &manifest, expected_manifest_hash, allow_unverified)?;
 
     if manifest.snapshot_format != SNAPSHOT_FORMAT {
         return Err(format!(

@@ -39,16 +39,13 @@ fn on_disk_config(dir: &std::path::Path) -> Config {
 const WRONG_MANIFEST_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-// Ignored by default: this full round-trip works end-to-end on a realistic multi-block state
-// (verified manually on testnet at height 268,000: export -> import -> re-export with an
-// identical manifest hash, and a tail-synced imported node). It is parked because building a
-// *genesis-only* on-disk fixture that satisfies every one of Zebra's on-open format-validation
-// invariants (cached genesis tree roots, per-height Sapling/Orchard trees, subtree format) is
-// brittle in a unit test. The format layer's determinism and integrity are covered without a DB
-// by the fast tests in `crate::snapshot::tests`. Run explicitly with:
-//   cargo test -p zebra-state --features proptest-impl -- --ignored snapshot_export_import_roundtrip
-#[ignore = "genesis-only on-disk fixture trips Zebra's format-validation invariants; \
-            covered by crate::snapshot::tests and manual multi-block verification"]
+// Full export -> import -> re-export round trip on a real on-disk database. The source state
+// is built through the production `StateService` commit path, so the genesis note-commitment
+// tree roots are cached and the exported database passes Zebra's on-open format validation.
+// (An earlier version used the raw `commit_finalized_direct` helper, which skips that caching
+// and tripped `cache_genesis_roots`; switching to the service path fixed it.) The format
+// layer's determinism and integrity are also covered without a database by the fast tests in
+// `crate::snapshot::tests`; this test additionally exercises the real RocksDB open/close path.
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_export_import_roundtrip() {
     let _init_guard = zebra_test::init();
@@ -88,8 +85,9 @@ async fn snapshot_export_import_roundtrip() {
             .expect("committing the genesis block should succeed");
 
         // Let the finalized write and the background version-file task settle before the
-        // primary database is dropped and then reopened by the exporter.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // primary database is dropped and then reopened by the exporter. Generous margin so
+        // the test stays reliable on slower CI runners, not just a fast dev machine.
+        tokio::time::sleep(Duration::from_secs(3)).await;
     } // drop flushes and closes the primary database
 
     let expected_tip_hash = genesis.hash();
